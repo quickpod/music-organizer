@@ -1,13 +1,14 @@
 {
   "slug": "music-organizer",
   "name": "MusicOrganizer",
-  "tagline": "Audio tag editor & library organizer \u2014 auto-tag, dedupe and bulk rename.",
+  "tagline": "Audio tag editor & library organizer — auto-tag, dedupe and bulk rename.",
   "categorySlug": "music-tools",
   "license": "Apache-2.0",
-  "description": "Manage a music library: edit ID3/Vorbis/FLAC tags and album art, auto-tag from filenames or fill missing fields, find duplicate tracks, and bulk-rename/organize files by tag patterns (Artist/Album/Track). An open-source Mp3tag-style toolkit \u2014 works entirely offline.",
+  "description": "Manage a music library: edit ID3/Vorbis/FLAC tags and album art, auto-tag from filenames or fill missing fields, find duplicate tracks, and bulk-rename/organize files by tag patterns (Artist/Album/Track). An open-source Mp3tag-style toolkit — works entirely offline.",
   "aiStack": "Python (tkinter + CLI), mutagen",
   "platforms": [
-    "windows"
+    "windows",
+    "linux"
   ],
   "buildEntry": "music_organizer_app.py"
 }
