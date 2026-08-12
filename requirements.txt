@@ -1,0 +1,2 @@
+# MusicOrganizer runtime deps — permissive/weak-copyleft only, no AGPL/proprietary.
+mutagen>=1.47
