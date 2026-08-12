@@ -1,2 +1,4 @@
 # MusicOrganizer runtime deps — permissive/weak-copyleft only, no AGPL/proprietary.
 mutagen>=1.47
+customtkinter>=5.2
+darkdetect>=0.8

@@ -1,8 +1,9 @@
 ; Inno Setup — MusicOrganizer. Signed single-file installer, compiled in CI.
 #define AppName "MusicOrganizer"
-#define AppVersion "1.0.0"
+#define AppVersion "1.0.1"
 
 [Setup]
+AppMutex=QuickOpen.MusicOrganizer
 AppId={{51A0F001-0016-4E5B-8C71-9B0E2F3A0016}
 AppName={#AppName}
 AppVersion={#AppVersion}
@@ -23,7 +24,7 @@ WizardSmallImageFile=branding\wizard-small.bmp
 AppCopyright=Apache-2.0. 100%% AI-built, published on QuickOpen (quickopen.ai).
 VersionInfoCompany=QuickOpen
 VersionInfoProductName=MusicOrganizer
-VersionInfoVersion=1.0.0.0
+VersionInfoVersion=1.0.1.0
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -57,13 +58,3 @@ Filename: "{app}\MusicOrganizer.exe"; Description: "Launch MusicOrganizer now"; 
 [UninstallDelete]
 Type: filesandordirs; Name: "{localappdata}\MusicOrganizer"
 
-[Code]
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-var ResultCode: Integer;
-begin
-  if CurUninstallStep = usUninstall then
-    if MsgBox('Also remove the QuickOpen Root CA from the Trusted Root store?' + #13#10 +
-              'Choose No if you use other QuickOpen apps that rely on it.',
-              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-      Exec('certutil.exe', '-delstore -user Root "QuickOpen Root CA"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-end;

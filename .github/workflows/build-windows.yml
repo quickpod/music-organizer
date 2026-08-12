@@ -20,8 +20,10 @@ jobs:
           pyinstaller --onefile --windowed --name MusicOrganizer
           --icon music-organizer.ico
           --version-file packaging/version.txt
+          --hidden-import musickit.__main__
           --add-data "music-organizer.ico;."
           --collect-submodules mutagen
+          --collect-all customtkinter
           music_organizer_app.py
       - name: Stage installer inputs
         shell: pwsh
@@ -41,4 +43,10 @@ jobs:
           path: |
             dist/MusicOrganizer.exe
             packaging/dist/MusicOrganizer-Setup.exe
+          if-no-files-found: error
+      - name: Upload staging (for signed repack)
+        uses: actions/upload-artifact@v4
+        with:
+          name: music-organizer-staging
+          path: packaging/staging
           if-no-files-found: error

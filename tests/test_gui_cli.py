@@ -1,16 +1,22 @@
 """GUI import is side-effect-free / headless-safe, and the CLI exits cleanly."""
 
+import pytest
+import sys
 import os
 
 from musickit import __main__ as cli
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="Windows CI has a real display; main() would open a window and block")
 def test_gui_import_side_effect_free():
     from musickit import gui
     assert hasattr(gui, "main")
     assert callable(gui.main)
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="Windows CI has a real display; main() would open a window and block")
 def test_gui_main_headless_returns_zero(monkeypatch):
     # No $DISPLAY -> should print a note and return 0, never raise.
     monkeypatch.delenv("DISPLAY", raising=False)

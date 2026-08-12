@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-r"""MusicOrganizer -- a pure-stdlib tkinter GUI on top of the ``musickit`` API.
+r"""MusicOrganizer -- an Aura (QuickOpen design system) GUI on the ``musickit`` API.
 
-A single main window: a left sidebar of tools (Library, Tag Editor, Auto-Tag,
-Rename / Organize, Duplicates) and a main panel that swaps to the selected
-tool.  Every operation calls the tested core library (never re-implements tag
-logic) and long scans run on a background thread so the UI stays responsive;
-results marshal back with ``self.after`` and are reported in an inline bar --
+A single Aura window: a sidebar of sections (Library, Tag Editor, Auto-Tag,
+Rename / Organize, Duplicates, About) and a swappable main panel.  Every
+operation calls the tested core library (never re-implements tag logic) and
+long scans run on a background thread so the UI stays responsive; results
+marshal back with ``self.after`` and are reported in the Aura status bar --
 never a raw traceback (a :class:`MusicKitError` message instead).
 
-Design goals baked in here:
-  * pure standard-library tkinter/ttk -- NO third-party GUI deps.  Dark mode is
-    a ttk-style + palette swap (the QuickOpen palette).
-  * Importing this module does nothing.  Only :func:`main` builds a root window,
-    and it degrades gracefully (prints a note, returns 0) with no display.
+Design goals baked in here (mirrors the QuickOpen house style):
+  * built on the vendored ``musickit/aura.py`` design system, which layers the
+    quickopen.ai look (deep space + light) over CustomTkinter.  Runtime deps:
+    ``customtkinter`` (+ ``darkdetect``) -- declared in requirements.txt; the
+    PyInstaller build adds ``--collect-all customtkinter``.
+  * Importing this module does nothing.  Only :func:`main` builds a root
+    window, and it degrades gracefully (prints a note, returns 0) with no
+    display or with customtkinter missing.
   * Frozen-exe safe: bundled assets resolve via ``sys._MEIPASS`` / the exe
     directory when ``sys.frozen`` is set -- never ``__file__``.
+  * Destructive steps (write tags, move files, delete duplicates) always
+    confirm with a dialog first; everything else previews before applying.
 
 100% AI-built, open source, published on QuickOpen (quickopen.ai).
 """
@@ -25,76 +30,37 @@ import os
 import sys
 import threading
 
-# NOTE: tkinter is imported lazily inside main()/build_app so that merely
-# importing this module (e.g. during packaging or on a headless CI box) never
-# fails.
+# NOTE: tkinter/customtkinter are imported lazily inside main()/build_app so
+# that merely importing this module (e.g. during packaging or on a headless CI
+# box) never fails.
 
 APP_NAME = "MusicOrganizer"
 APP_VERSION = "1.0.0"
 WINDOW_TITLE = "MusicOrganizer — by QuickOpen (quickopen.ai)"
 PROJECT_URL = "https://quickopen.ai"
+ACCENT = "#cf2d3a"      # UI-accent registry (ui/aurakit/README.md §2)
 
 IMAGE_TYPES = [
     ("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.webp"),
     ("All files", "*.*"),
 ]
 
-# (tool_id, label) -- tool_id maps to a _panel_<id> method.
-TOOLS = [
-    ("library", "Library"),
-    ("tageditor", "Tag Editor"),
-    ("autotag", "Auto-Tag"),
-    ("organize", "Rename / Organize"),
-    ("duplicates", "Duplicates"),
-]
-
-TOOL_DESCRIPTIONS = {
-    "library": "Scan a folder into a sortable table of tracks. Select rows to "
-               "edit them in the Tag Editor.",
-    "tageditor": "Edit tags (and cover art) on the tracks selected in the "
-                 "Library. Tick a field to batch-apply it to every selection.",
-    "autotag": "Infer tags from filenames with a pattern like "
-               "'{artist} - {title}'. Preview, then apply.",
-    "organize": "Rename/move files into a tag-based tree, e.g. "
-                "'{albumartist}/{album}/{track:02d} - {title}'. Preview first.",
-    "duplicates": "Find duplicate tracks by tags or content hash; review "
-                  "groups and remove the copies you don't want.",
-}
-
 # Columns shown in the library table (id, heading, width).
 LIB_COLUMNS = [
-    ("track", "#", 44),
-    ("title", "Title", 210),
-    ("artist", "Artist", 160),
-    ("album", "Album", 160),
-    ("year", "Year", 54),
-    ("genre", "Genre", 110),
-    ("duration_str", "Time", 60),
-    ("bitrate", "kbps", 54),
-    ("filename", "File", 200),
+    ("track", "#", 40),
+    ("title", "Title", 175),
+    ("artist", "Artist", 135),
+    ("album", "Album", 135),
+    ("year", "Year", 60),
+    ("genre", "Genre", 95),
+    ("duration_str", "Time", 56),
+    ("bitrate", "kbps", 58),
+    ("filename", "File", 130),
 ]
-
-# ---- colour palettes (mirror the QuickOpen palette) -------------------------
-PALETTES = {
-    "light": {
-        "bg": "#f5f7fa", "surface": "#ffffff", "text": "#141820",
-        "muted": "#5b6472", "primary": "#2f5fe0", "primary_hi": "#2450c8",
-        "entry": "#ffffff", "border": "#d5dae2", "sel": "#2f5fe0",
-        "sel_fg": "#ffffff", "trough": "#e2e7ef", "ok": "#1f7a3d",
-        "err": "#c0392b",
-    },
-    "dark": {
-        "bg": "#0f1115", "surface": "#1a1e24", "text": "#f1f3f7",
-        "muted": "#9aa4b2", "primary": "#5b86f7", "primary_hi": "#7098ff",
-        "entry": "#1a1e24", "border": "#2a2f38", "sel": "#5b86f7",
-        "sel_fg": "#0f1115", "trough": "#2a2f38", "ok": "#5bd68a",
-        "err": "#ff6b5e",
-    },
-}
 
 
 # ---------------------------------------------------------------------------
-# Asset / frozen handling
+# Asset / frozen handling  +  small OS helpers
 # ---------------------------------------------------------------------------
 def asset_path(name):
     """Locate a bundled asset from source OR a PyInstaller one-file build.
@@ -153,17 +119,19 @@ def open_with_default_app(path):
 
 
 # ---------------------------------------------------------------------------
-# The app (built lazily; tkinter imported only inside build_app/main)
+# The app (built lazily; tkinter/customtkinter imported only inside build_app)
 # ---------------------------------------------------------------------------
 def build_app():
-    """Construct and return the App class bound to a live tkinter import.
+    """Construct and return the App class bound to live GUI imports.
 
-    Kept inside a function so this module imports cleanly without a display.
+    Kept inside a function so this module imports cleanly without a display
+    (and without customtkinter installed).
     """
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
+    import customtkinter as ctk
 
-    from . import guiconfig
+    from . import aura, guiconfig
     from .errors import MusicKitError
     from . import tags as tagsmod
     from . import library as librarymod
@@ -172,78 +140,84 @@ def build_app():
     from . import organize as organizemod
     from .tags import UNIFIED_FIELDS
 
-    FONT = "Segoe UI"
+    class PathRow(ctk.CTkFrame):
+        """A path entry + Browse button (folder or file), Aura-styled."""
 
-    # -- small reusable widgets ------------------------------------------
-    class PathRow(ttk.Frame):
-        """A labelled path field + Browse button (folder or file)."""
-
-        def __init__(self, master, label, mode="dir", filetypes=None,
-                     on_change=None):
-            super().__init__(master, style="TFrame")
+        def __init__(self, master, placeholder, mode="dir", filetypes=None,
+                     browse_title=None):
+            super().__init__(master, fg_color="transparent")
             self.mode = mode
             self.filetypes = filetypes
-            self.var = tk.StringVar()
-            ttk.Label(self, text=label, width=14, anchor="w").pack(side="left")
-            ent = ttk.Entry(self, textvariable=self.var)
-            ent.pack(side="left", fill="x", expand=True, padx=(0, 6))
-            ttk.Button(self, text="Browse…", command=self._browse,
-                       width=10).pack(side="left")
-            if on_change:
-                self.var.trace_add("write", lambda *_: on_change(self.var.get()))
+            self.browse_title = browse_title
+            # no textvariable: CTkEntry placeholders only work without one
+            self.entry = aura.AuraEntry(self, placeholder=placeholder)
+            self.entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            aura.AuraButton(self, "Browse…", kind="secondary",
+                            command=self._browse).pack(side="left")
 
         def _browse(self):
             if self.mode == "dir":
-                p = filedialog.askdirectory(title="Choose a folder")
+                p = filedialog.askdirectory(
+                    title=self.browse_title or "Choose a folder")
             elif self.mode == "save":
                 p = filedialog.asksaveasfilename(
-                    title="Save as", filetypes=self.filetypes or IMAGE_TYPES)
+                    title=self.browse_title or "Save as",
+                    filetypes=self.filetypes or IMAGE_TYPES)
             else:
                 p = filedialog.askopenfilename(
-                    title="Choose a file", filetypes=self.filetypes or IMAGE_TYPES)
+                    title=self.browse_title or "Choose a file",
+                    filetypes=self.filetypes or IMAGE_TYPES)
             if p:
-                self.var.set(p)
+                self.set(p)
 
         def get(self):
-            return self.var.get().strip()
+            return self.entry.get().strip()
 
         def set(self, value):
-            self.var.set(value or "")
+            self.entry.delete(0, "end")
+            if value:
+                self.entry.insert(0, value)
 
-    # -- the main window --------------------------------------------------
-    class App(tk.Tk):
+    class App(aura.AuraApp):
         def __init__(self):
-            super().__init__()
-            self.title(WINDOW_TITLE)
-            self.geometry("1160x720")
-            self.minsize(940, 600)
+            super().__init__(
+                title=WINDOW_TITLE, app_name=APP_NAME, accent=ACCENT,
+                theme=guiconfig.get_theme(),
+                icon_png=asset_path("music-organizer.png"),
+                version=APP_VERSION, tagline="offline tagging",
+                on_theme_change=guiconfig.set_theme,
+                size=(1160, 720), min_size=(940, 600))
 
-            self.theme = guiconfig.get_theme()
             self._busy = False
-            self._panels = {}
-            self._current = None
-            self._tracked = []
-            self._img_refs = []
-            self._tracks = []              # scanned library rows (Library panel)
-            self._lib_iid = {}            # tree iid -> track dict
+            self._img_refs_gui = []        # NOT _img_refs (owned by AuraApp)
+            self._tracks = []              # scanned library rows (Library)
+            self._lib_iid = {}             # tree iid -> track dict
             self._lib_sort = (None, False)
             self._autotag_plan = []
             self._organize_plan = []
             self._dupe_groups = []
-            self._pending_cover = None    # (bytes, mime) staged in Tag Editor
+            self._pending_cover = None     # (bytes, mime) staged in Tag Editor
 
             self._set_icon()
             self._build_menu()
-            self._build_layout()
-            self._apply_theme()
+            self.add_section("library", "Library", "♪", self._build_library)
+            self.add_section("tageditor", "Tag Editor", "✎",
+                             self._build_tageditor)
+            self.add_section("autotag", "Auto-Tag", "✳", self._build_autotag)
+            self.add_section("organize", "Rename / Organize", "⇄",
+                             self._build_organize)
+            self.add_section("duplicates", "Duplicates", "⊚",
+                             self._build_duplicates)
+            self.add_section("about", "About", "◉", self._build_about)
+            self.show("library")
+            self.set_status("Ready")
             self.protocol("WM_DELETE_WINDOW", self.destroy)
-            self.after(50, self._select_first_tool)
 
         # ---- assets / icon
         def _set_icon(self):
             try:
                 ico = asset_path("music-organizer.ico")
-                if ico:
+                if ico and os.name == "nt":
                     self.iconbitmap(ico)
                     return
             except Exception:
@@ -252,120 +226,12 @@ def build_app():
                 png = asset_path("music-organizer.png")
                 if png:
                     img = tk.PhotoImage(file=png)
-                    self._img_refs.append(img)
+                    self._img_refs_gui.append(img)
                     self.iconphoto(True, img)
             except Exception:
                 pass  # icon is cosmetic; never block launch
 
-        # ---- theming
-        def track(self, widget, role):
-            self._tracked.append((widget, role))
-
-        def _pal(self):
-            return PALETTES[self.theme]
-
-        def _apply_theme(self):
-            p = self._pal()
-            style = ttk.Style(self)
-            try:
-                style.theme_use("clam")
-            except Exception:
-                pass
-            self.configure(bg=p["bg"])
-            style.configure(".", background=p["bg"], foreground=p["text"],
-                            fieldbackground=p["entry"], bordercolor=p["border"],
-                            font=(FONT, 10))
-            style.configure("TFrame", background=p["bg"])
-            style.configure("Sidebar.TFrame", background=p["surface"])
-            style.configure("TLabel", background=p["bg"], foreground=p["text"])
-            style.configure("Muted.TLabel", background=p["bg"], foreground=p["muted"])
-            style.configure("Header.TLabel", background=p["bg"], foreground=p["text"],
-                            font=(FONT, 15, "bold"))
-            style.configure("Sub.TLabel", background=p["bg"], foreground=p["muted"],
-                            font=(FONT, 10))
-            style.configure("Brand.TLabel", background=p["surface"],
-                            foreground=p["text"], font=(FONT, 12, "bold"))
-            style.configure("Status.TLabel", background=p["surface"],
-                            foreground=p["muted"])
-            style.configure("TButton", background=p["surface"], foreground=p["text"],
-                            bordercolor=p["border"], focuscolor=p["surface"],
-                            padding=(10, 5))
-            style.map("TButton",
-                      background=[("active", p["trough"]), ("disabled", p["bg"])],
-                      foreground=[("disabled", p["muted"])])
-            style.configure("Accent.TButton", background=p["primary"],
-                            foreground="#ffffff", padding=(12, 6))
-            style.map("Accent.TButton",
-                      background=[("active", p["primary_hi"]),
-                                  ("disabled", p["border"])],
-                      foreground=[("disabled", p["muted"])])
-            style.configure("Danger.TButton", background=p["err"],
-                            foreground="#ffffff", padding=(10, 5))
-            style.map("Danger.TButton",
-                      background=[("active", p["err"]), ("disabled", p["border"])])
-            style.configure("Toggle.TButton", background=p["surface"],
-                            foreground=p["text"], padding=(8, 4))
-            style.configure("Nav.TButton", background=p["surface"],
-                            foreground=p["text"], anchor="w", padding=(12, 9),
-                            font=(FONT, 11))
-            style.map("Nav.TButton", background=[("active", p["trough"])])
-            style.configure("NavSel.TButton", background=p["primary"],
-                            foreground="#ffffff", anchor="w", padding=(12, 9),
-                            font=(FONT, 11, "bold"))
-            style.map("NavSel.TButton", background=[("active", p["primary_hi"])])
-            for name in ("TEntry", "TSpinbox"):
-                style.configure(name, fieldbackground=p["entry"], foreground=p["text"],
-                                insertcolor=p["text"], bordercolor=p["border"])
-            style.configure("TCombobox", fieldbackground=p["entry"],
-                            foreground=p["text"], background=p["surface"],
-                            arrowcolor=p["text"])
-            style.map("TCombobox", fieldbackground=[("readonly", p["entry"])],
-                      foreground=[("readonly", p["text"])])
-            style.configure("TCheckbutton", background=p["bg"], foreground=p["text"])
-            style.map("TCheckbutton", background=[("active", p["bg"])])
-            style.configure("TRadiobutton", background=p["bg"], foreground=p["text"])
-            style.map("TRadiobutton", background=[("active", p["bg"])])
-            style.configure("TLabelframe", background=p["bg"], foreground=p["text"],
-                            bordercolor=p["border"])
-            style.configure("TLabelframe.Label", background=p["bg"],
-                            foreground=p["muted"])
-            style.configure("Treeview", background=p["surface"],
-                            fieldbackground=p["surface"], foreground=p["text"],
-                            bordercolor=p["border"], rowheight=24)
-            style.configure("Treeview.Heading", background=p["surface"],
-                            foreground=p["muted"], font=(FONT, 9, "bold"))
-            style.map("Treeview", background=[("selected", p["primary"])],
-                      foreground=[("selected", p["sel_fg"])])
-            style.configure("TScrollbar", background=p["surface"],
-                            troughcolor=p["bg"], bordercolor=p["border"],
-                            arrowcolor=p["text"])
-            style.configure("TSeparator", background=p["border"])
-
-            for widget, role in list(self._tracked):
-                try:
-                    if role == "text":
-                        widget.configure(bg=p["surface"], fg=p["text"],
-                                         insertbackground=p["text"],
-                                         selectbackground=p["primary"],
-                                         selectforeground=p["sel_fg"],
-                                         highlightthickness=1,
-                                         highlightbackground=p["border"],
-                                         borderwidth=0)
-                    elif role == "canvas":
-                        widget.configure(bg=p["surface"], highlightthickness=1,
-                                         highlightbackground=p["border"])
-                except Exception:
-                    pass
-            self._restyle_nav()
-
-        def toggle_theme(self):
-            self.theme = "dark" if self.theme == "light" else "light"
-            guiconfig.set_theme(self.theme)
-            self._apply_theme()
-            self._theme_btn.configure(
-                text="☀ Light mode" if self.theme == "dark" else "🌙 Dark mode")
-
-        # ---- menu
+        # ---- menu (native menus stay; theme lives in the sidebar switch too)
         def _build_menu(self):
             bar = tk.Menu(self)
             filem = tk.Menu(bar, tearoff=0)
@@ -379,11 +245,14 @@ def build_app():
             bar.add_cascade(label="File", menu=filem)
 
             viewm = tk.Menu(bar, tearoff=0)
-            viewm.add_command(label="Toggle dark mode", command=self.toggle_theme)
+            viewm.add_command(
+                label="Toggle dark mode",
+                command=lambda: self.set_theme(
+                    "light" if self.theme == "dark" else "dark"))
             bar.add_cascade(label="View", menu=viewm)
 
             helpm = tk.Menu(bar, tearoff=0)
-            helpm.add_command(label="About", command=self._about)
+            helpm.add_command(label="About", command=lambda: self.show("about"))
             helpm.add_command(label="Open project page (quickopen.ai)",
                               command=lambda: open_with_default_app(PROJECT_URL))
             bar.add_cascade(label="Help", menu=helpm)
@@ -413,92 +282,16 @@ def build_app():
         def _menu_scan(self):
             p = filedialog.askdirectory(title="Scan a music folder")
             if p:
-                self._select_tool("library")
+                self.show("library")
                 self._scan_into_library(p)
-
-        # ---- layout
-        def _build_layout(self):
-            top = ttk.Frame(self, style="Sidebar.TFrame", padding=(12, 8))
-            top.pack(fill="x", side="top")
-            ttk.Label(top, text="MusicOrganizer", style="Brand.TLabel").pack(side="left")
-            ttk.Label(top, style="Status.TLabel",
-                      text="  offline · open source · by QuickOpen").pack(side="left")
-            self._theme_btn = ttk.Button(
-                top, style="Toggle.TButton", command=self.toggle_theme,
-                text="☀ Light mode" if self.theme == "dark" else "🌙 Dark mode")
-            self._theme_btn.pack(side="right")
-
-            body = ttk.Frame(self, style="TFrame")
-            body.pack(fill="both", expand=True)
-
-            side = ttk.Frame(body, style="Sidebar.TFrame", width=210)
-            side.pack(side="left", fill="y")
-            side.pack_propagate(False)
-            self._nav_btns = {}
-            for tid, label in TOOLS:
-                b = ttk.Button(side, text=label, style="Nav.TButton",
-                               command=lambda t=tid: self._select_tool(t))
-                b.pack(fill="x", padx=6, pady=(6, 0))
-                self._nav_btns[tid] = b
-
-            main = ttk.Frame(body, style="TFrame", padding=(16, 12))
-            main.pack(side="left", fill="both", expand=True)
-            head = ttk.Frame(main, style="TFrame")
-            head.pack(fill="x")
-            self.title_lbl = ttk.Label(head, text="Welcome", style="Header.TLabel")
-            self.title_lbl.pack(anchor="w")
-            self.desc_lbl = ttk.Label(head, text="", style="Sub.TLabel",
-                                      wraplength=820, justify="left")
-            self.desc_lbl.pack(anchor="w", pady=(2, 8))
-            ttk.Separator(main).pack(fill="x")
-            self.container = ttk.Frame(main, style="TFrame")
-            self.container.pack(fill="both", expand=True, pady=(10, 8))
-
-            bar = ttk.Frame(self, style="Sidebar.TFrame", padding=(12, 6))
-            bar.pack(fill="x", side="bottom")
-            self.status_lbl = ttk.Label(bar, text="Ready", style="Status.TLabel",
-                                        width=16, anchor="w")
-            self.status_lbl.pack(side="left")
-            self.result_lbl = ttk.Label(bar, text="", style="Status.TLabel",
-                                        anchor="w", wraplength=820, justify="left")
-            self.result_lbl.pack(side="left", fill="x", expand=True, padx=8)
-
-        def _restyle_nav(self):
-            for tid, b in getattr(self, "_nav_btns", {}).items():
-                b.configure(style="NavSel.TButton" if tid == self._current
-                            else "Nav.TButton")
-
-        def _select_first_tool(self):
-            self._select_tool(TOOLS[0][0])
-
-        def _select_tool(self, tool_id):
-            if self._current == tool_id and self._panels.get(tool_id):
-                return
-            for panel in self._panels.values():
-                panel.pack_forget()
-            panel = self._panels.get(tool_id)
-            if panel is None:
-                panel = ttk.Frame(self.container, style="TFrame")
-                builder = getattr(self, "_panel_" + tool_id, None)
-                if builder:
-                    builder(panel)
-                else:
-                    ttk.Label(panel, text="Not implemented.").pack()
-                self._panels[tool_id] = panel
-                self._apply_theme()
-            panel.pack(fill="both", expand=True)
-            self._current = tool_id
-            self.title_lbl.configure(text=dict(TOOLS)[tool_id])
-            self.desc_lbl.configure(text=TOOL_DESCRIPTIONS.get(tool_id, ""))
-            self._clear_result()
-            self._restyle_nav()
 
         # ---- background operation runner
         def _bg(self, work, on_ok, button=None, busy="Working…"):
             """Run ``work()`` off the UI thread; call ``on_ok(result)`` back on it.
 
-            Errors are shown inline (MusicKitError message, or a generic note),
-            never as a traceback.  Refuses to start a second op concurrently.
+            Errors are shown in the status bar (MusicKitError message, or a
+            generic note), never as a traceback.  Refuses to start a second op
+            concurrently.
             """
             if self._busy:
                 self._show_error("Please wait — an operation is already running.")
@@ -509,7 +302,7 @@ def build_app():
                     button.state(["disabled"])
                 except Exception:
                     pass
-            self._set_status(busy, kind="working")
+            self.set_status(busy, kind="working")
 
             def run():
                 try:
@@ -528,10 +321,8 @@ def build_app():
                     except Exception:
                         pass
                 if err is not None:
-                    self._set_status("error", kind="err")
                     self._show_error(err)
                     return
-                self._set_status("done", kind="ok")
                 try:
                     on_ok(res)
                 except Exception as ex:
@@ -539,66 +330,31 @@ def build_app():
 
             threading.Thread(target=run, daemon=True).start()
 
-        # ---- result bar helpers
-        def _set_status(self, text, kind="idle"):
-            p = self._pal()
-            color = {"working": p["primary"], "ok": p["ok"], "err": p["err"]}.get(
-                kind, p["muted"])
-            self.status_lbl.configure(text=text, foreground=color)
-
-        def _clear_result(self):
-            self.result_lbl.configure(text="")
-            self._set_status("Ready")
-
+        # ---- status helpers (status bar is the voice of the app)
         def _show_error(self, message):
-            self.result_lbl.configure(text="✕ " + message,
-                                      foreground=self._pal()["err"])
+            self.set_error(message)
 
         def _show_ok(self, message):
-            self.result_lbl.configure(text="✓ " + message,
-                                      foreground=self._pal()["ok"])
-            self._set_status("done", kind="ok")
-
-        # ---- About
-        def _about(self):
-            win = tk.Toplevel(self)
-            win.title("About MusicOrganizer")
-            win.configure(bg=self._pal()["bg"])
-            win.resizable(False, False)
-            frm = ttk.Frame(win, style="TFrame", padding=18)
-            frm.pack(fill="both", expand=True)
-            ttk.Label(frm, text="MusicOrganizer", style="Header.TLabel").pack(anchor="w")
-            ttk.Label(frm, text=f"Version {APP_VERSION}",
-                      style="Sub.TLabel").pack(anchor="w", pady=(0, 8))
-            ttk.Label(frm, style="TLabel", justify="left", wraplength=380,
-                      text="A fast, fully-offline music tag & library manager — "
-                           "edit tags and cover art, auto-tag from filenames, "
-                           "find duplicates and organise by tag patterns.\n\n"
-                           "100% AI-built, open source, published on QuickOpen.\n"
-                           "Nothing is ever uploaded anywhere.").pack(anchor="w")
-            ttk.Label(frm, style="Sub.TLabel", justify="left", wraplength=380,
-                      text="Licensed under Apache-2.0. Built on mutagen.").pack(
-                anchor="w", pady=(8, 4))
-            link = ttk.Label(frm, text="Project page: quickopen.ai",
-                             style="Sub.TLabel", cursor="hand2")
-            link.pack(anchor="w", pady=(4, 10))
-            link.bind("<Button-1>", lambda e: open_with_default_app(PROJECT_URL))
-            ttk.Button(frm, text="Close", command=win.destroy).pack(anchor="e")
-            win.transient(self)
-            win.grab_set()
+            self.set_success(message)
 
         # =====================================================================
         # Shared table helper
         # =====================================================================
-        def _make_table(self, parent, columns, height=14, selectmode="extended"):
-            wrap = ttk.Frame(parent, style="TFrame")
+        def _make_table(self, parent, columns, selectmode="extended",
+                        sort_cb=None):
+            wrap = ctk.CTkFrame(parent, fg_color="transparent")
             wrap.pack(fill="both", expand=True)
             tree = ttk.Treeview(wrap, columns=[c[0] for c in columns],
-                                 show="headings", selectmode=selectmode,
-                                 height=height)
-            for cid, heading, width in columns:
-                tree.heading(cid, text=heading)
-                tree.column(cid, width=width, anchor="w", stretch=False)
+                                show="headings", selectmode=selectmode)
+            for i, (cid, heading, width) in enumerate(columns):
+                if sort_cb:
+                    tree.heading(cid, text=aura.spaced(heading), anchor="w",
+                                 command=lambda c=cid: sort_cb(c))
+                else:
+                    tree.heading(cid, text=aura.spaced(heading), anchor="w")
+                # last column absorbs spare width so tables fill their card
+                tree.column(cid, width=width, anchor="w",
+                            stretch=(i == len(columns) - 1))
             sb = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
             xsb = ttk.Scrollbar(wrap, orient="horizontal", command=tree.xview)
             tree.configure(yscrollcommand=sb.set, xscrollcommand=xsb.set)
@@ -610,31 +366,31 @@ def build_app():
         # =====================================================================
         # Library
         # =====================================================================
-        def _panel_library(self, parent):
-            self._lib_folder = PathRow(parent, "Music folder", mode="dir")
-            self._lib_folder.pack(fill="x", pady=4)
-            ctrl = ttk.Frame(parent, style="TFrame")
-            ctrl.pack(fill="x", pady=(0, 6))
-            ttk.Button(ctrl, text="Scan", style="Accent.TButton",
-                       command=self._do_scan).pack(side="left")
-            ttk.Label(ctrl, text="Filter", style="Muted.TLabel").pack(
-                side="left", padx=(14, 4))
-            self._lib_filter = tk.StringVar()
-            ent = ttk.Entry(ctrl, textvariable=self._lib_filter, width=24)
-            ent.pack(side="left")
-            ent.bind("<KeyRelease>", lambda e: self._refresh_lib_table())
-            ttk.Button(ctrl, text="Edit selected →",
-                       command=lambda: self._select_tool("tageditor")).pack(
+        def _build_library(self, frame):
+            bar = ctk.CTkFrame(frame, fg_color="transparent")
+            bar.pack(fill="x", pady=(0, 8))
+            self._lib_folder = PathRow(bar, "Music folder to scan…",
+                                       browse_title="Scan a music folder")
+            self._lib_folder.pack(side="left", fill="x", expand=True,
+                                  padx=(0, 8))
+            aura.AuraButton(bar, "Scan", command=self._do_scan).pack(
+                side="left")
+
+            ctrl = ctk.CTkFrame(frame, fg_color="transparent")
+            ctrl.pack(fill="x", pady=(0, 10))
+            self._lib_filter = aura.AuraEntry(
+                ctrl, placeholder="Filter — title, artist, album…", width=300)
+            self._lib_filter.pack(side="left")
+            self._lib_filter.bind("<KeyRelease>",
+                                  lambda _e: self._refresh_lib_table())
+            aura.AuraButton(ctrl, "Edit selected →", kind="ghost",
+                            command=lambda: self.show("tageditor")).pack(
                 side="right")
 
-            self._lib_tree = self._make_table(parent, LIB_COLUMNS, height=16)
-            for cid, heading, _w in LIB_COLUMNS:
-                self._lib_tree.heading(
-                    cid, text=heading,
-                    command=lambda c=cid: self._sort_library(c))
-            self._lib_count = ttk.Label(parent, text="No folder scanned yet.",
-                                        style="Muted.TLabel")
-            self._lib_count.pack(anchor="w", pady=(6, 0))
+            self._lib_tree = self._make_table(frame, LIB_COLUMNS,
+                                              sort_cb=self._sort_library)
+            self._lib_count = aura.Caption(frame, "No folder scanned yet.")
+            self._lib_count.pack(anchor="w", pady=(8, 0))
 
         def _do_scan(self):
             folder = self._lib_folder.get()
@@ -644,6 +400,7 @@ def build_app():
             self._scan_into_library(folder)
 
         def _scan_into_library(self, folder):
+            self.show("library")
             self._lib_folder.set(folder)
             guiconfig.add_recent(folder)
             self._fill_recent_menu()
@@ -660,7 +417,8 @@ def build_app():
             tree = getattr(self, "_lib_tree", None)
             if tree is None:
                 return
-            rows = librarymod.search_tracks(self._tracks, self._lib_filter.get())
+            rows = librarymod.search_tracks(self._tracks,
+                                            self._lib_filter.get().strip())
             field, rev = self._lib_sort
             if field:
                 rows = librarymod.sort_tracks(rows, field, reverse=rev)
@@ -690,51 +448,54 @@ def build_app():
         # =====================================================================
         # Tag Editor
         # =====================================================================
-        def _panel_tageditor(self, parent):
-            top = ttk.Frame(parent, style="TFrame")
-            top.pack(fill="x", pady=(0, 6))
-            ttk.Button(top, text="↻ Load from Library selection",
-                       command=self._tageditor_load).pack(side="left")
-            self._te_count = ttk.Label(top, text="Nothing selected.",
-                                       style="Muted.TLabel")
-            self._te_count.pack(side="left", padx=10)
+        def _build_tageditor(self, frame):
+            top = ctk.CTkFrame(frame, fg_color="transparent")
+            top.pack(fill="x", pady=(0, 10))
+            aura.AuraButton(top, "↻ Load from Library selection",
+                            kind="secondary",
+                            command=self._tageditor_load).pack(side="left")
+            self._te_count = aura.Caption(top, "Nothing selected.")
+            self._te_count.pack(side="left", padx=12)
 
-            grid = ttk.Frame(parent, style="TFrame")
-            grid.pack(fill="x")
+            fields_card = aura.Card(frame, title="Fields")
+            fields_card.pack(fill="x")
+            grid = fields_card.body
             self._te_vars = {}
             self._te_apply = {}
             for i, field in enumerate(UNIFIED_FIELDS):
                 chk = tk.BooleanVar(value=False)
                 self._te_apply[field] = chk
-                ttk.Checkbutton(grid, variable=chk).grid(row=i, column=0, padx=(0, 4))
-                ttk.Label(grid, text=field, width=12, anchor="w").grid(
-                    row=i, column=1, sticky="w")
+                ctk.CTkCheckBox(grid, text=field, variable=chk, width=120,
+                                font=aura.font()).grid(
+                    row=i, column=0, sticky="w", pady=2)
                 var = tk.StringVar()
                 self._te_vars[field] = var
-                ent = ttk.Entry(grid, textvariable=var, width=52)
-                ent.grid(row=i, column=2, sticky="we", pady=1)
+                # no placeholder here, so a textvariable is safe
+                ent = aura.AuraEntry(grid, textvariable=var)
+                ent.grid(row=i, column=1, sticky="we", pady=2, padx=(8, 0))
                 var.trace_add("write",
                               lambda *_a, f=field: self._te_apply[f].set(True))
-            grid.columnconfigure(2, weight=1)
-            ttk.Label(parent, style="Muted.TLabel", wraplength=760, justify="left",
-                      text="Tick a field to include it when applying. A ticked "
-                           "field with empty text CLEARS that tag on every "
-                           "selected track.").pack(anchor="w", pady=(6, 6))
+            grid.columnconfigure(1, weight=1)
+            aura.Caption(frame,
+                         "Tick a field to include it when applying. A ticked "
+                         "field with empty text CLEARS that tag on every "
+                         "selected track.").pack(anchor="w", pady=(8, 10))
 
-            cover = ttk.Labelframe(parent, text="Cover art", padding=8)
-            cover.pack(fill="x", pady=4)
-            ttk.Button(cover, text="Load image…",
-                       command=self._te_load_cover).pack(side="left")
-            ttk.Button(cover, text="Save cover from selection…",
-                       command=self._te_save_cover).pack(side="left", padx=6)
-            self._te_cover_lbl = ttk.Label(cover, text="No image staged.",
-                                           style="Muted.TLabel")
-            self._te_cover_lbl.pack(side="left", padx=10)
+            cover = aura.Card(frame, title="Cover art")
+            cover.pack(fill="x")
+            row = ctk.CTkFrame(cover.body, fg_color="transparent")
+            row.pack(fill="x")
+            aura.AuraButton(row, "Load image…", kind="secondary",
+                            command=self._te_load_cover).pack(side="left")
+            aura.AuraButton(row, "Save cover from selection…", kind="secondary",
+                            command=self._te_save_cover).pack(
+                side="left", padx=8)
+            self._te_cover_lbl = aura.Caption(row, "No image staged.")
+            self._te_cover_lbl.pack(side="left", padx=12)
 
-            run = ttk.Frame(parent, style="TFrame")
-            run.pack(fill="x", pady=(8, 0))
-            ttk.Button(run, text="Apply to selection", style="Accent.TButton",
-                       command=self._te_apply_now).pack(side="left")
+            aura.AuraButton(frame, "Apply to selection",
+                            command=self._te_apply_now).pack(
+                anchor="w", pady=(12, 0))
 
         def _tageditor_load(self):
             sel = self._selected_tracks()
@@ -833,37 +594,42 @@ def build_app():
         # =====================================================================
         # Auto-Tag
         # =====================================================================
-        def _panel_autotag(self, parent):
-            self._at_folder = PathRow(parent, "Folder", mode="dir")
-            self._at_folder.pack(fill="x", pady=4)
-            row = ttk.Frame(parent, style="TFrame")
-            row.pack(fill="x", pady=4)
-            ttk.Label(row, text="Pattern", width=14, anchor="w").pack(side="left")
+        def _build_autotag(self, frame):
+            card = aura.Card(frame, title="Infer tags from filenames")
+            card.pack(fill="x", pady=(0, 10))
+            self._at_folder = PathRow(card.body, "Folder with audio files…")
+            self._at_folder.pack(fill="x", pady=(0, 8))
+            row = ctk.CTkFrame(card.body, fg_color="transparent")
+            row.pack(fill="x", pady=(0, 8))
             self._at_pattern = tk.StringVar(value="{artist} - {title}")
-            ttk.Entry(row, textvariable=self._at_pattern).pack(
-                side="left", fill="x", expand=True)
-            opts = ttk.Frame(parent, style="TFrame")
-            opts.pack(fill="x", pady=2)
+            aura.AuraEntry(row, textvariable=self._at_pattern, width=340).pack(
+                side="left")
+            aura.Caption(row, "Pattern").pack(side="left", padx=8)
+            opts = ctk.CTkFrame(card.body, fg_color="transparent")
+            opts.pack(fill="x", pady=(0, 6))
             self._at_only_missing = tk.BooleanVar(value=True)
             self._at_use_folder = tk.BooleanVar(value=False)
-            ttk.Checkbutton(opts, text="Only fill missing tags",
-                            variable=self._at_only_missing).pack(side="left")
-            ttk.Checkbutton(opts, text="Match parent folder too",
-                            variable=self._at_use_folder).pack(side="left", padx=12)
-            ttk.Label(parent, style="Muted.TLabel",
-                      text="Fields: {title} {artist} {album} {albumartist} "
-                           "{track} {disc} {year} {genre} {comment}").pack(
-                anchor="w", pady=(2, 6))
-            btns = ttk.Frame(parent, style="TFrame")
+            ctk.CTkCheckBox(opts, text="Only fill missing tags",
+                            variable=self._at_only_missing,
+                            font=aura.font()).pack(side="left")
+            ctk.CTkCheckBox(opts, text="Match parent folder too",
+                            variable=self._at_use_folder,
+                            font=aura.font()).pack(side="left", padx=14)
+            aura.Caption(card.body,
+                         "Fields: {title} {artist} {album} {albumartist} "
+                         "{track} {disc} {year} {genre} {comment}").pack(
+                anchor="w", pady=(0, 8))
+            btns = ctk.CTkFrame(card.body, fg_color="transparent")
             btns.pack(fill="x")
-            ttk.Button(btns, text="Preview", style="Accent.TButton",
-                       command=self._at_preview).pack(side="left")
-            self._at_apply_btn = ttk.Button(btns, text="Apply changes",
-                                            command=self._at_apply)
-            self._at_apply_btn.pack(side="left", padx=6)
+            aura.AuraButton(btns, "Preview",
+                            command=self._at_preview).pack(side="left")
+            self._at_apply_btn = aura.AuraButton(btns, "Apply changes",
+                                                 kind="secondary",
+                                                 command=self._at_apply)
+            self._at_apply_btn.pack(side="left", padx=8)
+
             self._at_tree = self._make_table(
-                parent, [("file", "File", 260), ("changes", "Would set", 520)],
-                height=13)
+                frame, [("file", "File", 260), ("changes", "Would set", 520)])
 
         def _at_preview(self):
             folder = self._at_folder.get()
@@ -916,36 +682,42 @@ def build_app():
         # =====================================================================
         # Rename / Organize
         # =====================================================================
-        def _panel_organize(self, parent):
-            self._org_folder = PathRow(parent, "Source folder", mode="dir")
-            self._org_folder.pack(fill="x", pady=4)
-            self._org_dest = PathRow(parent, "Destination", mode="dir")
-            self._org_dest.pack(fill="x", pady=4)
-            row = ttk.Frame(parent, style="TFrame")
-            row.pack(fill="x", pady=4)
-            ttk.Label(row, text="Pattern", width=14, anchor="w").pack(side="left")
+        def _build_organize(self, frame):
+            card = aura.Card(frame, title="Rename / move by tag pattern")
+            card.pack(fill="x", pady=(0, 10))
+            self._org_folder = PathRow(card.body, "Source folder…")
+            self._org_folder.pack(fill="x", pady=(0, 8))
+            self._org_dest = PathRow(
+                card.body, "Destination — blank renames in place…")
+            self._org_dest.pack(fill="x", pady=(0, 8))
+            row = ctk.CTkFrame(card.body, fg_color="transparent")
+            row.pack(fill="x", pady=(0, 8))
             self._org_pattern = tk.StringVar(
                 value="{albumartist}/{album}/{track:02d} - {title}")
-            ttk.Entry(row, textvariable=self._org_pattern).pack(
-                side="left", fill="x", expand=True)
-            opts = ttk.Frame(parent, style="TFrame")
-            opts.pack(fill="x", pady=2)
+            aura.AuraEntry(row, textvariable=self._org_pattern,
+                           width=420).pack(side="left")
+            aura.Caption(row, "Pattern").pack(side="left", padx=8)
+            opts = ctk.CTkFrame(card.body, fg_color="transparent")
+            opts.pack(fill="x", pady=(0, 6))
             self._org_copy = tk.BooleanVar(value=True)
-            ttk.Checkbutton(opts, text="Copy (leave originals in place)",
-                            variable=self._org_copy).pack(side="left")
-            ttk.Label(parent, style="Muted.TLabel",
-                      text="Use '/' for subfolders and specs like {track:02d}. "
-                           "Leave Destination blank to rename in place.").pack(
-                anchor="w", pady=(2, 6))
-            btns = ttk.Frame(parent, style="TFrame")
+            ctk.CTkCheckBox(opts, text="Copy (leave originals in place)",
+                            variable=self._org_copy,
+                            font=aura.font()).pack(side="left")
+            aura.Caption(card.body,
+                         "Use '/' for subfolders and specs like {track:02d}. "
+                         "Leave Destination blank to rename in place.").pack(
+                anchor="w", pady=(0, 8))
+            btns = ctk.CTkFrame(card.body, fg_color="transparent")
             btns.pack(fill="x")
-            ttk.Button(btns, text="Preview", style="Accent.TButton",
-                       command=self._org_preview).pack(side="left")
-            self._org_apply_btn = ttk.Button(btns, text="Apply",
-                                             command=self._org_apply)
-            self._org_apply_btn.pack(side="left", padx=6)
+            aura.AuraButton(btns, "Preview",
+                            command=self._org_preview).pack(side="left")
+            self._org_apply_btn = aura.AuraButton(btns, "Apply",
+                                                  kind="secondary",
+                                                  command=self._org_apply)
+            self._org_apply_btn.pack(side="left", padx=8)
+
             self._org_tree = self._make_table(
-                parent, [("src", "From", 320), ("target", "To", 460)], height=13)
+                frame, [("src", "From", 320), ("target", "To", 460)])
 
         def _org_preview(self):
             folder = self._org_folder.get()
@@ -992,39 +764,45 @@ def build_app():
         # =====================================================================
         # Duplicates
         # =====================================================================
-        def _panel_duplicates(self, parent):
-            self._dup_folder = PathRow(parent, "Folder", mode="dir")
-            self._dup_folder.pack(fill="x", pady=4)
-            row = ttk.Frame(parent, style="TFrame")
-            row.pack(fill="x", pady=4)
-            ttk.Label(row, text="Match by", width=14, anchor="w").pack(side="left")
+        def _build_duplicates(self, frame):
+            bar = ctk.CTkFrame(frame, fg_color="transparent")
+            bar.pack(fill="x", pady=(0, 8))
+            self._dup_folder = PathRow(bar, "Folder to check…")
+            self._dup_folder.pack(side="left", fill="x", expand=True,
+                                  padx=(0, 8))
             self._dup_by = tk.StringVar(value="tags")
-            ttk.Combobox(row, textvariable=self._dup_by, state="readonly", width=10,
-                         values=["tags", "hash", "both"]).pack(side="left")
-            ttk.Button(row, text="Find duplicates", style="Accent.TButton",
-                       command=self._dup_find).pack(side="left", padx=10)
+            aura.AuraCombo(bar, variable=self._dup_by, state="readonly",
+                           width=110,
+                           values=["tags", "hash", "both"]).pack(side="left")
+            aura.AuraButton(bar, "Find duplicates",
+                            command=self._dup_find).pack(
+                side="left", padx=(8, 0))
+
+            body = ctk.CTkFrame(frame, fg_color="transparent")
+            body.pack(fill="both", expand=True)
             self._dup_tree = ttk.Treeview(
-                parent, columns=["path", "time"], show="tree headings",
-                selectmode="extended", height=15)
-            self._dup_tree.heading("#0", text="Group")
-            self._dup_tree.heading("path", text="Path")
-            self._dup_tree.heading("time", text="Time")
-            self._dup_tree.column("#0", width=180, stretch=False)
-            self._dup_tree.column("path", width=520, stretch=False)
+                body, columns=["path", "time"], show="tree headings",
+                selectmode="extended")
+            self._dup_tree.heading("#0", text=aura.spaced("Group"), anchor="w")
+            self._dup_tree.heading("path", text=aura.spaced("Path"), anchor="w")
+            self._dup_tree.heading("time", text=aura.spaced("Time"), anchor="w")
+            self._dup_tree.column("#0", width=200, stretch=False)
+            self._dup_tree.column("path", width=520, stretch=True)
             self._dup_tree.column("time", width=70, stretch=False)
-            sb = ttk.Scrollbar(parent, orient="vertical",
+            sb = ttk.Scrollbar(body, orient="vertical",
                                command=self._dup_tree.yview)
             self._dup_tree.configure(yscrollcommand=sb.set)
             sb.pack(side="right", fill="y")
-            self._dup_tree.pack(fill="both", expand=True, pady=(6, 0))
-            actions = ttk.Frame(parent, style="TFrame")
-            actions.pack(fill="x", pady=(6, 0))
-            ttk.Button(actions, text="Delete selected files",
-                       style="Danger.TButton",
-                       command=self._dup_delete).pack(side="left")
-            ttk.Label(actions, style="Muted.TLabel",
-                      text="  Select the copies to remove (keeps whatever you "
-                           "don't select). Deletion is permanent.").pack(side="left")
+            self._dup_tree.pack(side="left", fill="both", expand=True)
+
+            actions = ctk.CTkFrame(frame, fg_color="transparent")
+            actions.pack(fill="x", pady=(10, 0))
+            aura.AuraButton(actions, "Delete selected files", kind="danger",
+                            command=self._dup_delete).pack(side="left")
+            aura.Caption(actions,
+                         "Select the copies to remove (keeps whatever you "
+                         "don't select). Deletion is permanent.").pack(
+                side="left", padx=10)
 
         def _dup_find(self):
             folder = self._dup_folder.get()
@@ -1082,6 +860,31 @@ def build_app():
                 self._dup_find()
             self._bg(work, done, busy="Deleting…")
 
+        # =====================================================================
+        # About
+        # =====================================================================
+        def _build_about(self, frame):
+            card = aura.Card(frame, title="About MusicOrganizer")
+            card.pack(fill="x")
+            aura.Heading(card.body, APP_NAME).pack(anchor="w")
+            aura.Caption(card.body, f"Version {APP_VERSION}").pack(
+                anchor="w", pady=(0, 10))
+            ctk.CTkLabel(
+                card.body, font=aura.font(), justify="left", anchor="w",
+                wraplength=520,
+                text="A fast, fully-offline music tag & library manager — "
+                     "edit tags and cover art, auto-tag from filenames, "
+                     "find duplicates and organise by tag patterns.\n\n"
+                     "100% AI-built, open source, published on QuickOpen. "
+                     "Nothing is ever uploaded anywhere.").pack(anchor="w")
+            aura.Caption(card.body,
+                         "Licensed under Apache-2.0. Built on mutagen and "
+                         "CustomTkinter (MIT).").pack(anchor="w", pady=(10, 4))
+            aura.AuraButton(card.body, "Project page: quickopen.ai",
+                            kind="ghost",
+                            command=lambda: open_with_default_app(
+                                PROJECT_URL)).pack(anchor="w", pady=(6, 0))
+
     return App
 
 
@@ -1089,8 +892,8 @@ def main():
     """Entry point: build the root window and run.  Degrades on headless hosts.
 
     Importing this module does nothing; only this function creates a Tk root.
-    With no display (e.g. a server), it prints a friendly note and returns 0
-    instead of raising.
+    With no display (e.g. a server) or without customtkinter installed, it
+    prints a friendly note and returns 0 instead of raising.
     """
     try:
         import tkinter as tk
@@ -1102,6 +905,10 @@ def main():
     try:
         App = build_app()
         app = App()
+    except ImportError as exc:
+        print(f"{APP_NAME}: the GUI needs the 'customtkinter' package "
+              f"({exc}). Install it with:  pip install customtkinter")
+        return 0
     except tk.TclError as exc:
         print(f"{APP_NAME}: no graphical display available — cannot start the "
               f"GUI here ({exc}). This app is intended for the Windows desktop.")
