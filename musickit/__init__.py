@@ -58,7 +58,7 @@ from .organize import (
     sanitize_component,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.0.5"
 
 __all__ = [
     "MusicKitError",
